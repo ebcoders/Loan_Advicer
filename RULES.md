@@ -162,6 +162,23 @@ not just in which Tier-2 questions appear later.
 
 ## Change log
 
+- v0.3 — Found and fixed two verdict-logic bugs, both caught by deep-dive testing after the app
+  was built, not before:
+  - **The verdict boundary check was comparing a borrower's desired loan against the wrong
+    product's rate.** It always used a generic unsecured rate (e.g. 21% for Ravi) even for
+    borrowers who get routed to a secured loan (Ravi's actual LAP rate: 9-11.5%). This made Ravi's
+    verdict say "Borrow Less" when, under his real routed terms, his full ₹15,00,000 ask actually
+    fit. Fixed: routing (secured vs unsecured, and which rate/tenure) is now decided *before* the
+    verdict check runs, and the check uses those actual terms.
+  - **Fixing the above then exposed a second bug**: once Ravi's verdict flipped to "Borrow" for
+    the full amount, his recommended amount stopped being checked against the stress test at
+    all — "Borrow" verdicts had never been passed through the stress-consistent ceiling from
+    v0.2's fix, only "Borrow Less" ones had. Fixed by computing one unified, stress-consistent
+    safe ceiling *before* the verdict decision, and using that same number both to decide the
+    verdict boundary and to cap the recommended amount — so every verdict (not just Borrow Less)
+    now provably survives its own stress test by construction.
+  - Net effect on Ravi's case: verdict is Borrow Less at ₹12,00,000 (not the full ₹15,00,000) —
+    this is now the *correct*, stress-tested answer, not a workaround.
 - v0.2 — Corrected FOIR to include rent in both lender and safe views (previous draft incorrectly
   excluded rent from the lender view). Replaced "different obligation definitions" mechanism with
   "margin + stress test" mechanism for the lender/safe split.

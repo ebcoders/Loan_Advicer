@@ -118,6 +118,15 @@ initial product choice.
 (which alone would support up to ₹24,75,000) and credit for his stated business ROI, his
 *income* — the stricter of the two constraints — only safely supports ~₹12.7L before rounding.
 
+**A note on how this number was reached:** an earlier version of the verdict logic checked
+Ravi's affordability against a generic unsecured rate (21%) even though he's routed to a secured
+loan at 9-11.5% — which briefly made the app say "Borrow" for his full ₹15L, before that
+recommendation was checked against the required stress test and found to fail it. Both issues
+are now fixed: the verdict check uses his actual routed (secured) terms, and every verdict —
+not just Borrow Less — is now built from a ceiling that's already guaranteed to survive the
+stress test. ₹12,00,000 is the number that holds up under both corrections. See RULES.md
+changelog v0.3 for the full detail.
+
 **Note on his wife's ₹18,000 income:** collected but **not currently added** to his eligibility
 figures above, since this isn't confirmed as a joint application (see OPEN_QUESTIONS.md #3). If
 he applies jointly with his wife as co-applicant, his eligibility would likely rise — worth raising

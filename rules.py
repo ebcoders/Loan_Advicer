@@ -237,18 +237,31 @@ def evaluate_secured_route(answers):
 # RULES.md SS6 -- Verdict logic (two-layer)
 # =========================================================================
 
-def mid_rate(answers):
-    if answers["income_type"] == "salaried":
-        if answers.get("credit_status") == "known" and answers.get("credit_score", 0) >= 750:
-            band = RATE_BANDS["personal_unsecured_prime"]
-        else:
-            band = RATE_BANDS["personal_unsecured_standard"]
+def determine_routing(answers, income_result, secured_route):
+    """Decide which product/rate/tenure a borrower would actually use. Must run
+    BEFORE the verdict check -- see BUGFIX 3 below for why."""
+    use_secured = secured_route is not None and (
+        answers.get("credit_status") == "ntc" or income_result["confidence"] != "high"
+    )
+    if use_secured:
+        rate_band = secured_route["rate_band"]
+        tenure_months = secured_route["tenure_months"]
+        routed_product = ("Loan Against Property (residential)"
+                           if secured_route["type"] == "residential"
+                           else "Loan Against Property (commercial)")
     else:
-        band = RATE_BANDS["business_unsecured_informal"]
-    return sum(band) / 2
+        if answers["income_type"] == "salaried":
+            rate_band = (RATE_BANDS["personal_unsecured_prime"]
+                         if answers.get("credit_status") == "known" and answers.get("credit_score", 0) >= 750
+                         else RATE_BANDS["personal_unsecured_standard"])
+        else:
+            rate_band = RATE_BANDS["business_unsecured_informal"]
+        tenure_months = answers.get("tenure_months", 60)
+        routed_product = "Unsecured personal/business loan"
+    return use_secured, rate_band, tenure_months, routed_product
 
 
-def compute_verdict(answers, ceilings):
+def compute_verdict(answers, ceilings, safe_loan_ceiling):
     # Layer 1 -- hard stops (checked first, independent of ratio math)
     if answers.get("bounced_payment_last_3mo"):
         return {
@@ -264,10 +277,16 @@ def compute_verdict(answers, ceilings):
                       "there is no room for a new EMI before something changes.",
         }
 
-    # Layer 2 -- ratio check against the desired amount
-    tenure = answers.get("tenure_months", 60)
-    desired_emi = emi(answers["amount_wanted"], mid_rate(answers), tenure)
-    if desired_emi <= ceilings["safe_available_emi"]:
+    # Layer 2 -- ratio check against the desired amount.
+    # BUGFIX 3+4: compare the desired AMOUNT directly against safe_loan_ceiling, which
+    # is already (a) computed at the correctly-routed product's rate/tenure -- not a
+    # generic unsecured mid_rate() -- and (b) stress-consistent by construction (see
+    # BUGFIX 2). Earlier versions of this check used a separate, looser EMI comparison
+    # that could say "Borrow" for an amount that then FAILED its own required stress
+    # test -- found by testing Ravi's case after BUGFIX 3 was applied. Comparing
+    # directly against safe_loan_ceiling means every "Borrow" verdict is now
+    # guaranteed to survive the stress test too, not just "Borrow Less" ones.
+    if answers["amount_wanted"] <= safe_loan_ceiling:
         return {"verdict": "borrow", "reason": "The amount you want fits within a safe monthly EMI."}
     return {
         "verdict": "borrow_less",
@@ -306,7 +325,28 @@ def run_assessment(answers):
     assessed_income = income_result["assessed_income"]
     ceilings = compute_ceilings(answers, assessed_income)
     secured_route = evaluate_secured_route(answers)
-    verdict_result = compute_verdict(answers, ceilings)
+
+    # Routing decided before the verdict check -- see BUGFIX 3.
+    use_secured, rate_band, tenure_months, routed_product = determine_routing(
+        answers, income_result, secured_route
+    )
+    mid_rate_pct = sum(rate_band) / 2
+
+    # Unified safe ceiling -- computed ONCE, used for both the verdict boundary and
+    # the recommended amount. See BUGFIX 4: this is what guarantees "Borrow" verdicts
+    # pass their own stress test too, not just "Borrow Less" ones.
+    lender_loan_ceiling = principal_from_emi(ceilings["lender_available_emi"], mid_rate_pct, tenure_months)
+    margin_based_safe_ceiling = principal_from_emi(ceilings["safe_available_emi"], mid_rate_pct, tenure_months)
+    stressed_income = assessed_income * (1 - STRESS_INCOME_DROP_PCT)
+    stressed_capacity_emi = max(0, ceilings["lender_cap"] * stressed_income - ceilings["existing"])
+    stress_consistent_ceiling = principal_from_emi(
+        stressed_capacity_emi, mid_rate_pct + STRESS_RATE_BUMP_PCT, tenure_months
+    )
+    safe_loan_ceiling = min(margin_based_safe_ceiling, stress_consistent_ceiling)
+    if use_secured:
+        safe_loan_ceiling = min(safe_loan_ceiling, secured_route["ceiling"])
+
+    verdict_result = compute_verdict(answers, ceilings, safe_loan_ceiling)
 
     output = {
         "income": income_result,
@@ -334,46 +374,7 @@ def run_assessment(answers):
         }
         return output
 
-    # Borrow / Borrow Less
-    use_secured = secured_route is not None and (
-        answers.get("credit_status") == "ntc" or income_result["confidence"] != "high"
-    )
-    if use_secured:
-        rate_band = secured_route["rate_band"]
-        tenure_months = secured_route["tenure_months"]
-        routed_product = ("Loan Against Property (residential)"
-                           if secured_route["type"] == "residential"
-                           else "Loan Against Property (commercial)")
-    else:
-        if answers["income_type"] == "salaried":
-            rate_band = (RATE_BANDS["personal_unsecured_prime"]
-                         if answers.get("credit_status") == "known" and answers.get("credit_score", 0) >= 750
-                         else RATE_BANDS["personal_unsecured_standard"])
-        else:
-            rate_band = RATE_BANDS["business_unsecured_informal"]
-        tenure_months = answers.get("tenure_months", 60)
-        routed_product = "Unsecured personal/business loan"
-
-    mid_rate_pct = sum(rate_band) / 2
-
-    lender_loan_ceiling = principal_from_emi(ceilings["lender_available_emi"], mid_rate_pct, tenure_months)
-    margin_based_safe_ceiling = principal_from_emi(ceilings["safe_available_emi"], mid_rate_pct, tenure_months)
-
-    # BUGFIX 2: the margin-based ceiling above was found (by testing) to sometimes
-    # fail the required stress test -- it was a separate, inconsistent mechanism.
-    # Fix: also compute the largest loan that SURVIVES the stress case by
-    # construction (rate +2pts, income -10%, still under lender cap), and take
-    # whichever ceiling is stricter. This guarantees the recommended amount
-    # always passes its own stress test.
-    stressed_income = assessed_income * (1 - STRESS_INCOME_DROP_PCT)
-    stressed_capacity_emi = max(0, ceilings["lender_cap"] * stressed_income - ceilings["existing"])
-    stress_consistent_ceiling = principal_from_emi(
-        stressed_capacity_emi, mid_rate_pct + STRESS_RATE_BUMP_PCT, tenure_months
-    )
-    safe_loan_ceiling = min(margin_based_safe_ceiling, stress_consistent_ceiling)
-    if use_secured:
-        safe_loan_ceiling = min(safe_loan_ceiling, secured_route["ceiling"])
-
+    # Borrow / Borrow Less -- ceiling and routing already decided above.
     recommended_amount = (answers["amount_wanted"] if verdict_result["verdict"] == "borrow"
                           else round_down_ceiling(safe_loan_ceiling))
 
